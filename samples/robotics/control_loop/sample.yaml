@@ -1,0 +1,40 @@
+sample:
+  name: Robotics control loop
+  description: Deterministic zbus control loop with acquisition timestamps
+    and a pluggable transport bridge
+common:
+  tags:
+    - robotics
+    - zbus
+  harness: console
+  timeout: 60
+  harness_config:
+    type: multi_line
+    ordered: false
+    regex:
+      - "loop: n="
+      - "estop: actuator commanded to zero"
+    record:
+      regex:
+        - "RECORD:(?P<metrics>.*)"
+      as_json: ["metrics"]
+  integration_platforms:
+    - native_sim
+tests:
+  sample.robotics.control_loop:
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+      - apollo510_evb
+      - qemu_cortex_m3
+  sample.robotics.control_loop.serial:
+    extra_args: EXTRA_CONF_FILE="overlay-serial.conf"
+    platform_allow:
+      - native_sim
+      - native_sim/native/64
+      - apollo510_evb
+  sample.robotics.control_loop.udp:
+    extra_args: EXTRA_CONF_FILE="overlay-udp.conf"
+    platform_allow:
+      - native_sim
+      - native_sim/native/64

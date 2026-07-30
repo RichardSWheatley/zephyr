@@ -1,0 +1,32 @@
+/*
+ * Bridge link on UART1 (TX P41, RX P43), mirroring the pin choice used
+ * by the Ambiq robotics module samples on this EVB.
+ *
+ * Copyright (c) 2026 Ambiq Micro Inc. <www.ambiq.com>
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+/ {
+	aliases {
+		bridge-uart = &uart1;
+	};
+};
+
+&uart1 {
+	status = "okay";
+	current-speed = <921600>;
+	pinctrl-0 = <&uart1_default>;
+	pinctrl-names = "default";
+};
+
+&pinctrl {
+	uart1_default: uart1_default {
+		group1 {
+			pinmux = <UART1TX_P41>;
+		};
+		group2 {
+			pinmux = <UART1RX_P43>;
+			input-enable;
+		};
+	};
+};
