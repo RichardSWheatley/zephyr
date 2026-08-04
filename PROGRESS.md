@@ -89,12 +89,64 @@ virtual seconds (~127k cycles), so the wrap occurs mid-suite. Result: `SUITE PAS
 `update_tick_counter()` wrap extension handled it correctly. This is repeatable on demand —
 something the physical EVB cannot do (a 32768 Hz counter takes ~36 h to wrap naturally).
 
-twister.json archives: `PROGRESS-artifacts/twister-t2.json` (first run, pre-fix, shows the
-two findings failing) and `PROGRESS-artifacts/twister-t2-fix.json` (kernel.timer green).
+twister.json archives: `PROGRESS-artifacts/twister-t2.json` (run with the model drift fix
+already applied — timeout_churn passing, and kernel.timer still showing the Finding-2
+margin failure) and `PROGRESS-artifacts/twister-t2-fix.json` (kernel.timer green after the
+test-bound fix). The pre-model-fix timeout_churn failure is evidenced by the handler-log
+measurements quoted in Finding 1 ("near-boundary arm 68 took 14 ms to fire"); that run's
+build tree was replaced by the rerun, so its JSON is not archived.
 
-## T3 — Scoped kernel set
+## T3 — Scoped kernel set — DONE: 113 passed, 10 quarantined (documented), 0 unexplained failures
 
-_pending_
+`west twister -p apollo510_evb/apollo510 --simulation renode -T tests/kernel
+--quarantine-list boards/ambiq/apollo510_evb/support/renode-quarantine.yaml`
+
+Final tally across `tests/kernel` (the ARB WG kernel-only benchmark surface — logic/ordering
+only, no timing claims):
+
+| Status | Count | Notes |
+|---|---|---|
+| **passed** | **113** | incl. all timer/sleep/timeout/scheduling-logic, IPC, memory, syscalls, SMP-adjacent single-core suites |
+| quarantined | 10 | every entry carries its root cause in `support/renode-quarantine.yaml` (summary below) |
+| not run | 3 | twister defaults: slow-tagged (`kernel.timer.starve.soak`) / build-only variants |
+
+Quarantine summary (full analyses in BLOCKERS.md B1/B4/B5):
+- 7 scenarios (stack_protection ×3, schedule_api ×4) — **Renode 1.16.1 does not enforce
+  ARMv8-M MPU protections** (B4): overflow runs past the stack guard silently; the
+  schedule_api userspace case dies in a zeroed-frame oops. Note the
+  `kernel.memory_protection.syscalls.*` suites DO pass — syscall/privilege plumbing works,
+  fault-on-violation does not.
+- 2 scenarios (stack_protection_arm_fpu_sharing, fpu_sharing.float_disable) — CONFIG_FPU=y
+  images hit the **LSLL BusFault** (B1.1) before console init.
+- 1 scenario (tickless.concept) — **genuine ambiq_stimer driver limitation** (B5): the suite
+  forces 100 ticks/s and 32768/100 is fractional; integer CYC_PER_TICK=327 aliases
+  time-slice boundaries (measured 11/20/0/0 ticks vs expected ~10). Reproduces on real
+  hardware for any tick rate not dividing 32768; the board default 1024 (32 cycles/tick,
+  exact) is unaffected.
+
+Fixes that emerged from this sweep (all in this branch):
+1. `timeout_multiplier: 6` added to `apollo510_evb.yaml` (hifive1 precedent) — six suites
+   (workqueue.critical, syscalls ×2, lto ×2, timer.monotonic) failed purely on twister's
+   default 60 s host-time budget under emulation.
+2. `tests/kernel/context` `thread_sleep` slop converted floor→ceil (same two-tick class as
+   the timer_api fix; probe-verified: k_msleep(50) sleeps exactly 53 ticks = the
+   architecturally-minimal tickless sleep, which reads back as 52 ms in some phases while
+   the floored slop allowed 51).
+3. The OTP/TRNG block became a python peripheral whose TRNG word returns a fresh
+   deterministic-PRNG value per read (constant "entropy" broke
+   kernel.memory_protection.stack_random; real randomness would break reproducibility).
+   First cut used a wrong PythonPeripheral API casing (`request.isInit` vs the correct
+   `request.IsInit`), which crashed Renode on any access to the page — visible as rc=1
+   "run_renode died at boot" on pipe.api/stack_random in the first final-sweep pass; all
+   three affected scenarios pass in the serial rerun with the fix.
+4. `kernel.memory_protection.syscalls.kyield` is host-load sensitive: it times out under
+   4-way parallel twister but passes serially (`-j 1`) — a wall-clock budget artifact, not
+   a platform defect.
+
+twister.json archives: `PROGRESS-artifacts/twister-t3-initial.json` (first full sweep,
+pre-fixes: 104/19/3), `twister-t3-final.json` (with quarantine + fixes: 110 passed),
+`twister-t3-flaky-rerun.json` (serial rerun of the three TRNG/load-affected scenarios: all
+passed → effective total 113).
 
 ## T5a — MVE smoke — DONE (QEMU PASS; Renode FAIL → contingency invoked)
 
@@ -135,6 +187,11 @@ zscilib @ upstream master bf1cbf1 ("general: update zephyr libraries"), **unpatc
 diff clean (669 result lines each). Zero numeric divergence at assertion level between
 QEMU's and Renode's FP arithmetic on these suites. Logs:
 `PROGRESS-artifacts/zscilib-qemu-an547.log`, `PROGRESS-artifacts/zscilib-renode-apollo510.log`.
+
+§6 twister.json gates (scenario `zsl.core.c.single` via `--force-platform` +
+`-x=ZEPHYR_EXTRA_MODULES=…`; Renode leg additionally `-x=EXTRA_CFLAGS=-mcpu=cortex-m55+nomve`):
+both **passed** — `PROGRESS-artifacts/twister-zscilib-qemu-an547.json`,
+`PROGRESS-artifacts/twister-zscilib-renode-apollo510.json`.
 
 Still blocked (B2): the MVE-patched rerun — requires the actual §0 patch; and any
 MVE-accelerated zscilib path on Renode — requires the B1 Renode fixes.
