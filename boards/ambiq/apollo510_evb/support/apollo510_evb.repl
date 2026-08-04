@@ -91,10 +91,29 @@ ctimer: Memory.MappedMemory @ sysbus 0x40008000
     size: 0x800
 
 // OTP block (0x40014800 page, incl. PTMSTAT at +0x2C4) and the PUF TRNG
-// word (0x40014AA0) used as the entropy source; zero reads are benign for
-// the boot path (OTP stays unpowered: SHADOWVALID.INFO1SELOTP == 0).
-otp: Memory.MappedMemory @ sysbus 0x40014000
+// word (0x40014AA0) used as the entropy source. Implemented as a python
+// peripheral: the TRNG word returns a fresh value from a deterministic
+// PRNG on every read (a constant would make e.g. stack-pointer
+// randomization degenerate, breaking kernel.memory_protection.stack_random,
+// while real randomness would break run-to-run reproducibility); all other
+// offsets behave as read/write scratch, so PTMSTAT reads 0 (= not BUSY)
+// until written.
+otp: Python.PythonPeripheral @ sysbus 0x40014000
     size: 0x1000
+    initable: true
+    script: '''
+if request.IsInit:
+    otpStore = {}
+    prngState = 0x2F6E2B1
+elif request.IsRead:
+    if request.Offset == 0xAA0:
+        prngState = (prngState * 1103515245 + 12345) & 0xFFFFFFFF
+        request.Value = prngState
+    else:
+        request.Value = otpStore.get(request.Offset, 0)
+elif request.IsWrite:
+    otpStore[request.Offset] = request.Value
+'''
 
 // MCUCTRL_REG_BASE. Left all-zero on purpose: CHIPREV == 0 makes every
 // APOLLO5_A0/B0/B1/B2 revision check false, so am_hal_spotmgr_init()

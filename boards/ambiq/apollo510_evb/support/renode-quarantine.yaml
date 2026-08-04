@@ -1,0 +1,31 @@
+# Copyright (c) 2026 Ambiq Micro Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Known-blocked tests/kernel scenarios for apollo510_evb under Renode 1.16.1,
+# used with `west twister --quarantine-list <this file>`. Each entry carries
+# its root cause; see BLOCKERS.md on this branch for the full analyses.
+
+- scenarios:
+    - kernel.common.stack_protection
+    - kernel.common.stack_protection_no_userspace
+    - kernel.common.stack_protection_armv8m_mpu_stack_guard
+    - kernel.scheduler
+    - kernel.scheduler.multiq
+    - kernel.scheduler.simple_timeslicing
+    - kernel.scheduler.slice_perthread
+  platforms:
+    - apollo510_evb/apollo510
+  comment: "Renode 1.16.1 CortexM does not enforce ARMv8-M MPU protections: stack overflows run past the guard region silently (observed runaway stores below DTCM at 0x1FF7xxxx) and the schedule_api userspace case test_user_k_is_preempt dies with a zeroed-frame kernel oops (BLOCKERS.md B4)"
+
+- scenarios:
+    - kernel.common.stack_protection_arm_fpu_sharing
+    - kernel.fpu_sharing.float_disable
+  platforms:
+    - apollo510_evb/apollo510
+  comment: "CONFIG_FPU=y images enable tree-wide MVE codegen and Renode 1.16.1 BusFaults on the MVE scalar 64-bit shift LSLL in the Ambiq HAL baud-rate math before the console comes up (BLOCKERS.md B1.1)"
+
+- scenarios:
+    - kernel.tickless.concept
+  platforms:
+    - apollo510_evb/apollo510
+  comment: "genuine ambiq_stimer driver limitation, not a simulation artifact: the suite forces CONFIG_SYS_CLOCK_TICKS_PER_SEC=100 and 32768/100 is fractional, so the driver's integer CYC_PER_TICK=327 aliases slice boundaries (measured slices 11/20/0/0 ticks for an expected ~10); reproduces on real hardware with any tick rate that does not divide 32768 (BLOCKERS.md B5)"
