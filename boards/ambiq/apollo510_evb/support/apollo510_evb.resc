@@ -1,0 +1,49 @@
+# Copyright (c) 2026 Ambiq Micro Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+:name: Apollo510 EVB
+:description: This script runs Zephyr on the Ambiq Apollo510 EVB (Cortex-M55) in Renode.
+
+$name?="apollo510_evb"
+
+# Compile the board-local peripheral models before the platform description
+# references them.
+path add $ORIGIN
+include @AmbiqApollo5_SystemTimer.cs
+include @AmbiqApollo5_PowerController.cs
+
+mach create $name
+machine LoadPlatformDescription $ORIGIN/apollo510_evb.repl
+
+showAnalyzer sysbus.uart0
+
+macro reset
+"""
+    sysbus LoadELF $elf
+    cpu EnableZephyrMode
+    cpu VectorTableOffset `sysbus GetSymbolAddress "_vector_table"`
+
+    # Pre-seed the power/clock words the Ambiq HAL boot path checks, so its
+    # spin-waits and guards fall straight through (addresses/values from
+    # hal_ambiq mcu/apollo510/hal/am_hal_pwrctrl.c, am_hal_clkgen.c,
+    # am_hal_sysctrl.c against CMSIS apollo510.h; STATUS registers read as
+    # mirrors of these ENABLE registers - see AmbiqApollo5_PowerController.cs):
+    #
+    # PWRCTRL->DEVPWREN = UART0..3 (bits 9-12) + DBG (bit 26) powered;
+    # OTP and CRYPTO deliberately left off so their quiesce paths are never
+    # entered. am_hal_pwrctrl_periph_enable(UART0) polls DEVPWRSTATUS for
+    # the whole 0x1E00 HCPA-domain mask, which this satisfies immediately.
+    sysbus WriteDoubleWord 0x40021004 0x04001E00
+    # PWRCTRL->MEMPWREN = TCM[2:0] + NVM0 + NVM1 + ROM: makes
+    # am_hal_pwrctrl_mcu_memory_config() see its target MEMPWRSTATUS
+    # (mask 0xCF) already met.
+    sysbus WriteDoubleWord 0x40021014 0x0000003F
+    # PWRCTRL->SSRAMPWREN = all 3 MB banks: am_hal_pwrctrl_sram_config()
+    # sees SSRAMPWRST == 7 and skips its write+poll block.
+    sysbus WriteDoubleWord 0x40021024 0x00000007
+    # CLKGEN->CLOCKENSTAT: HFRC2READY (bit 24) - belt-and-braces for any
+    # code path that requests HFRC2 and polls for readiness.
+    sysbus WriteDoubleWord 0x40004030 0x01000000
+"""
+
+runMacro $reset

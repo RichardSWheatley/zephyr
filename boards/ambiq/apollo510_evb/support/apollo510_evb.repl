@@ -1,0 +1,138 @@
+// Copyright (c) 2026 Ambiq Micro Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Renode platform description for the Ambiq Apollo510 EVB (Cortex-M55).
+//
+// This is a deliberately partial SoC model: it covers what Zephyr needs to
+// boot and run the kernel test suites in deterministic virtual time - CPU,
+// NVIC, memories, STIMER (system clock), UART0 (console) and just enough of
+// the power/clock/control blocks for the Ambiq HAL boot path to fall
+// through cleanly. MSPI / IOM / GPIO / NPU and timing fidelity are
+// explicitly out of scope.
+//
+// All base addresses and sizes come from the devicetree
+// (dts/arm/ambiq/ambiq_apollo510.dtsi resolving macros from hal_ambiq
+// dts/apollo510/am_apollo510.h) and CMSIS apollo510.h - see the per-node
+// comments.
+
+cpu: CPU.CortexM @ sysbus
+    cpuType: "cortex-m55"
+    nvic: nvic
+
+nvic: IRQControllers.NVIC @ sysbus 0xE000E000
+    -> cpu@0
+
+// ITCM_BASE_ADDR/ITCM_MAX_SIZE (am_apollo510.h)
+itcm: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0x40000
+
+// DTCM_BASE_ADDR/DTCM_MAX_SIZE
+dtcm: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x7C000
+
+// SSRAM_BASE_ADDR/SSRAM_MAX_SIZE - full 3 MB aperture; the board dts caps
+// zephyr,sram at 2 MB and dedicates the following 1 MB to SRAM_NO_CACHE,
+// both of which live inside this region.
+ssram: Memory.MappedMemory @ sysbus 0x20080000
+    size: 0x300000
+
+// MRAM_BASE_ADDR/MRAM_MAX_SIZE - zephyr,flash; code is loaded and executed
+// from here (no fixed-partitions node, image links from the MRAM base).
+mram: Memory.MappedMemory @ sysbus 0x00410000
+    size: 0x3F0000
+
+// INFO1 space (NVM_OTP window). am_hal_info1_read() does plain loads from
+// this region during am_hal_pwrctrl_low_power_init() when
+// MCUCTRL->SHADOWVALID.INFO1SELOTP == 0; zero-filled memory reads as trim
+// version 0, which routes the HAL through its simplest (no-op) trim paths.
+info1: Memory.MappedMemory @ sysbus 0x42000000
+    size: 0x10000
+
+// UART0_REG_BASE, IRQ 15 (ambiq,uart is a PL011 derivative; the vendor
+// CLKEN/CLKSEL bits the Ambiq HAL reads back live in CR bits 3-6, which
+// Renode's PL011 stores as "Vendor specific" read/write flags).
+uart0: UART.PL011 @ sysbus 0x40039000
+    -> nvic@15
+
+// STIMER_REG_BASE; comparator A..H -> IRQ 32..39, capture/overflow -> 40.
+// Zephyr's drivers/timer/ambiq_stimer.c uses compare A (IRQ 32) only on
+// Apollo5x. Model source: support/AmbiqApollo5_SystemTimer.cs (compiled by
+// the .resc before this file is loaded).
+stimer: Timers.AmbiqApollo5_SystemTimer @ sysbus 0x40008800
+    IRQA -> nvic@32
+    IRQB -> nvic@33
+    IRQC -> nvic@34
+    IRQD -> nvic@35
+    IRQE -> nvic@36
+    IRQF -> nvic@37
+    IRQG -> nvic@38
+    IRQH -> nvic@39
+    IRQI -> nvic@40
+
+// PWRCTRL_REG_BASE. Power STATUS registers mirror their ENABLE
+// counterparts so HAL enable/disable spin-waits always terminate - see
+// support/AmbiqApollo5_PowerController.cs.
+pwrctrl: Miscellaneous.AmbiqApollo5_PowerController @ sysbus 0x40021000
+
+// The blocks below are modeled as plain RAM ("reads return what was last
+// written"): the boot path only performs configuration writes plus
+// read-once gates against them, and the .resc pre-seeds the handful of
+// status words the HAL checks (see apollo510_evb.resc).
+
+// CLKGEN_REG_BASE - clock generator; CLOCKENSTAT & co. pre-seeded.
+clkgen: Memory.MappedMemory @ sysbus 0x40004000
+    size: 0x1000
+
+// TIMER block (timer0..15, 0x40008000..0x400087FF). With MCUCTRL->CHIPREV
+// reading 0 the HAL's SPOT-manager dispatch table stays empty, so its
+// internal TIMER15 is never programmed; scratch RAM absorbs any stray
+// configuration writes.
+ctimer: Memory.MappedMemory @ sysbus 0x40008000
+    size: 0x800
+
+// OTP block (0x40014800 page, incl. PTMSTAT at +0x2C4) and the PUF TRNG
+// word (0x40014AA0) used as the entropy source; zero reads are benign for
+// the boot path (OTP stays unpowered: SHADOWVALID.INFO1SELOTP == 0).
+otp: Memory.MappedMemory @ sysbus 0x40014000
+    size: 0x1000
+
+// MCUCTRL_REG_BASE. Left all-zero on purpose: CHIPREV == 0 makes every
+// APOLLO5_A0/B0/B1/B2 revision check false, so am_hal_spotmgr_init()
+// leaves its dispatch table NULL and every am_hal_spotmgr_* call is a
+// no-op - this skips the VRSTATUS/trim-table polling paths entirely.
+// SHADOWVALID == 0 keeps INFO1 reads on the plain-MRAM path with OTP off.
+mcuctrl: Memory.MappedMemory @ sysbus 0x40020000
+    size: 0x1000
+
+// WDT (wdt0 is status "okay" in the board dts; the watchdog driver is only
+// initialized when CONFIG_WATCHDOG is enabled - scratch keeps stray
+// accesses harmless).
+wdt: Memory.MappedMemory @ sysbus 0x40024000
+    size: 0x1000
+
+// GPIO block - pinctrl (drivers/pinctrl/pinctrl_ambiq.c) writes pad
+// configuration words here during UART pin muxing; configuration-only, no
+// status polls, so scratch RAM suffices.
+gpio: Memory.MappedMemory @ sysbus 0x40010000
+    size: 0x1000
+
+// SECURITY block incl. the hw-crc32 seed/result word at 0x40030030.
+security: Memory.MappedMemory @ sysbus 0x40030000
+    size: 0x1000
+
+sysbus:
+    init:
+        // Fire-and-forget accesses on the PM idle path (am_hal_sysctrl_sleep):
+        // PWRMODCTL->CPDLPSTATE writes and the SYNC_READ bus-flush dummy read.
+        // Same treatment as Renode's stock ambiq-apollo4 platform.
+        SilenceRange <0xE001E300, 0xE001E30F>
+        SilenceRange <0x47FF0000, 0x47FF0007>
+
+        Tag <0x40004000,0x40004FFF> "CLKGEN"
+        Tag <0x40008000,0x400087FF> "TIMER"
+        Tag <0x40010000,0x40010FFF> "GPIO"
+        Tag <0x40014000,0x40014FFF> "OTP"
+        Tag <0x40020000,0x40020FFF> "MCUCTRL"
+        Tag <0x40024000,0x40024FFF> "WDT"
+        Tag <0x40030000,0x40030FFF> "SECURITY"
+        Tag <0x42000000,0x4200FFFF> "INFO1"
