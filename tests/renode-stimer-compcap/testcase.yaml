@@ -1,0 +1,13 @@
+# Copyright (c) 2026 Ambiq Micro Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+tests:
+  boards.apollo510_evb.stimer.compcap:
+    tags:
+      - stimer
+      - simulation
+    platform_allow:
+      - apollo510_evb/apollo510
+    harness: robot
+    harness_config:
+      robot_testsuite: compcap.robot
