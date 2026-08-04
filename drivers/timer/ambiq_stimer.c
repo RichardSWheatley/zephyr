@@ -25,6 +25,14 @@
 
 #define COUNTER_MAX UINT32_MAX
 
+/* Distance from one counter value to the same value after a wrap: the STIMER
+ * overflows from 0xFFFFFFFF back to 0, so one full lap is 2^32 counts, not
+ * COUNTER_MAX. Extending a wrapped counter read by COUNTER_MAX would lose one
+ * cycle per wrap and let the tick boundaries drift off the counter by one
+ * cycle each time the counter rolls over.
+ */
+#define COUNTER_SPAN ((uint64_t)COUNTER_MAX + 1U)
+
 #define CYC_PER_TICK (sys_clock_hw_cycles_per_sec() / CONFIG_SYS_CLOCK_TICKS_PER_SEC)
 #define MAX_TICKS    ((k_ticks_t)(COUNTER_MAX / CYC_PER_TICK) - 1)
 #define MAX_CYCLES   (MAX_TICKS * CYC_PER_TICK)
@@ -72,10 +80,10 @@ static void update_tick_counter(void)
 	uint32_t now = am_hal_stimer_counter_get();
 
 	/* If current cycle count is smaller than the last time stamp, a counter overflow happened.
-	 * We need to extend the current counter value to 64 bits and add it with 0xFFFFFFFF
-	 * to get the correct elapsed cycles.
+	 * We need to extend the current counter value to 64 bits and add one full counter span
+	 * (2^32) to get the correct elapsed cycles.
 	 */
-	uint64_t now_64 = (g_last_time_stamp <= now) ? (uint64_t)now : (uint64_t)now + COUNTER_MAX;
+	uint64_t now_64 = (g_last_time_stamp <= now) ? (uint64_t)now : (uint64_t)now + COUNTER_SPAN;
 
 	/* Get elapsed cycles */
 	uint32_t elapsed_cycle = (now_64 - g_last_time_stamp);
@@ -119,10 +127,10 @@ void stimer_isr(const void *arg)
 
 			/* If current cycle count is smaller than the last time stamp, a counter
 			 * overflow happened. We need to extend the current counter value to 64 bits
-			 * and add 0xFFFFFFFF to get the correct elapsed cycles.
+			 * and add one full counter span (2^32) to get the correct elapsed cycles.
 			 */
 			uint64_t now_64 = (g_last_time_stamp <= now) ? (uint64_t)now
-								     : (uint64_t)now + COUNTER_MAX;
+								     : (uint64_t)now + COUNTER_SPAN;
 
 			uint32_t delta = (now_64 + MIN_DELAY < next) ? (next - now_64) : MIN_DELAY;
 
@@ -163,7 +171,7 @@ void sys_clock_set_timeout(uint32_t ticks, bool idle)
 	 * last < now_64 < next
 	 */
 	uint64_t last = (uint64_t)g_last_time_stamp;
-	uint64_t now_64 = (g_last_time_stamp <= now) ? (uint64_t)now : (uint64_t)now + COUNTER_MAX;
+	uint64_t now_64 = (g_last_time_stamp <= now) ? (uint64_t)now : (uint64_t)now + COUNTER_SPAN;
 	uint64_t next = now_64 + ticks * CYC_PER_TICK;
 
 	uint32_t gap = next - last;
