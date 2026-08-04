@@ -744,13 +744,22 @@ ZTEST_USER(timer_api, test_timer_remaining)
 	 * While the busy_wait_ms() works with the maximum possible resolution,
 	 * the k_timer api is limited by the system tick abstraction. As result
 	 * the value obtained through k_timer_remaining_get() could be larger
-	 * than actual remaining time with maximum error equal to one tick.
-	 * That one tick of error has to be converted to ms by rounding up:
-	 * a tick shorter than a millisecond would otherwise round down to a
-	 * zero tolerance and the legitimate one-tick overshoot would trip the
-	 * check on high tick rate platforms.
+	 * than actual remaining time with maximum error equal to two ticks:
+	 * one from the partial-current-tick alignment z_add_timeout() applies
+	 * when the timer is started off a tick boundary, and one from the
+	 * ceiling conversions (duration ms->ticks at start, remaining
+	 * ticks->ms in k_timer_remaining_get()). Both have to be converted to
+	 * ms by rounding up: a tick shorter than a millisecond would
+	 * otherwise round down to a zero tolerance and the legitimate
+	 * overshoot would trip the check on high tick rate platforms. On
+	 * hardware, busy-wait overhead usually eats into the overshoot, but a
+	 * cycle-exact simulator performs the busy-wait with (near) zero
+	 * overhead and observes the full two-tick error: e.g. at 1024 ticks/s
+	 * a 100 ms timer expires at tick ceil(102.4)+1 = 104, an exact 50 ms
+	 * busy-wait elapses floor(51.2) = 51 ticks, and the remaining 53
+	 * ticks read back as ceil(51.75) = 52 ms against a 50+1 ms bound.
 	 */
-	zassert_true(rem_ms <= (DURATION / 2) + k_ticks_to_ms_ceil64(1),
+	zassert_true(rem_ms <= (DURATION / 2) + k_ticks_to_ms_ceil64(2),
 		     NULL);
 
 	/* We stopped half way through the wait, so the remaining ticks
