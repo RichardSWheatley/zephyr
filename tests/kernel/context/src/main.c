@@ -949,7 +949,15 @@ static void thread_sleep(void *delta, void *arg2, void *arg3)
 	k_msleep(timeout);
 	timestamp = k_uptime_get() - timestamp;
 
-	int slop = MAX(k_ticks_to_ms_floor64(2), 1);
+	/* The intended tolerance is two ticks (partial-current-tick alignment
+	 * plus ms->ticks rounding at sleep start). Convert it by rounding up:
+	 * with ticks shorter than a millisecond, flooring truncates the
+	 * allowance (e.g. 2 ticks at 1024 Hz is 1.95 ms, floored to 1 ms) and
+	 * the architecturally-minimal tickless sleep - exactly
+	 * ceil(timeout)+1 ticks, measured here as up to timeout+2 ms - trips
+	 * the check on platforms with precise (simulated) time.
+	 */
+	int slop = MAX(k_ticks_to_ms_ceil64(2), 1);
 
 	if (timestamp < timeout || timestamp > timeout + slop) {
 		TC_ERROR("timestamp out of range, got %d\n", (int)timestamp);
