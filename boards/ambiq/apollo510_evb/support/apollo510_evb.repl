@@ -85,10 +85,12 @@ clkgen: Memory.MappedMemory @ sysbus 0x40004000
 
 // TIMER block (timer0..15, 0x40008000..0x400087FF). With MCUCTRL->CHIPREV
 // reading 0 the HAL's SPOT-manager dispatch table stays empty, so its
-// internal TIMER15 is never programmed; scratch RAM absorbs any stray
-// configuration writes.
-ctimer: Memory.MappedMemory @ sysbus 0x40008000
-    size: 0x800
+// internal TIMER15 is never programmed; the stub keeps reads-as-written
+// scratch semantics for the whole page and additionally forwards
+// GLOBEN.ENABLEALLINPUTS (offset 0x10, bit 29) into the STIMER model's
+// capture gate, which am_hal_stimer_capture_start()/_stop() toggle.
+ctimer: Timers.AmbiqApollo5_TimerStub @ sysbus 0x40008000
+    systemTimer: stimer
 
 // OTP block (0x40014800 page, incl. PTMSTAT at +0x2C4) and the PUF TRNG
 // word (0x40014AA0) used as the entropy source. Implemented as a python

@@ -5,40 +5,69 @@
 // This file is licensed under the MIT License.
 // Full license text is available in Renode's 'licenses/MIT.txt'.
 //
-// Apollo510 STIMER model, adapted from Renode's AmbiqApollo4_SystemTimer
-// (renode-infrastructure, MIT). The Apollo510 STIMER register map is
-// identical to the Apollo4 one at every offset this model implements
-// (STCFG 0x00, STTMR 0x04, SCAPCTRLn 0x10-0x1C, SCMPRn 0x20-0x3C,
-// SCAPTn 0x40-0x4C, SNVR0/1 0x50-0x54, STMINTEN/STAT/CLR/SET 0x100-0x10C;
-// CMSIS apollo510.h STIMER_Type). Differences handled here:
-//  * 0x58 is HALSTATES on Apollo510 (SNVR2 on Apollo4) - both behave as a
-//    read/write scratch word from software's point of view, modeled below.
+// Apollo510 STIMER model, originally adapted from Renode's
+// AmbiqApollo4_SystemTimer (renode-infrastructure, MIT). The Apollo510
+// STIMER register map is identical to the Apollo4 one at every offset this
+// model implements (STCFG 0x00, STTMR 0x04, SCAPCTRLn 0x10-0x1C, SCMPRn
+// 0x20-0x3C, SCAPTn 0x40-0x4C, SNVR0/1 0x50-0x54, STMINTEN/STAT/CLR/SET
+// 0x100-0x10C; CMSIS apollo510.h STIMER_Type). Divergences from the stock
+// Apollo4 model, each tracked to the Apollo510 sources:
+//
+//  * Counter modulus is 2^32: STTMR counts 0..0xFFFFFFFF and overflows
+//    "from 0xFFFFFFFF back to 0x00000000" (STMINT OVERFLOW description).
+//    The stock model used limit uint.MaxValue = 2^32-1, which made
+//    0xFFFFFFFF unobservable and lost one tick per wrap - exactly
+//    cancelling an off-by-one in software that extends the wrapped
+//    counter by 0xFFFFFFFF instead of 2^32.
+//  * A COMPARE target the counter has already met or passed raises the
+//    interrupt status instead of stalling until the next 2^32-tick lap:
+//    the STMINT COMPAREx bits are documented as "COUNTER is greater than
+//    or equal to COMPARE register x". This matters when the counter is
+//    jumped over a pending target (CounterValue preload) or a comparator
+//    is enabled against a stale target; SCMPR writes themselves always
+//    produce a target ahead of the counter (write = unsigned delta).
+//  * The OVERFLOW interrupt status is one backing flag manipulated by
+//    STMINTEN/STAT/CLR/SET callbacks. (The stock model re-bound one field
+//    variable in three register definitions, leaving STMINTCLR unable to
+//    clear the status - IRQ 40 latched forever after a wrap - and
+//    STMINTSET.OVERFLOW a no-op.)
+//  * SCAPCTRL.STSEL is 8 bits wide with reset 0xFF (Apollo510 has 224
+//    GPIO pads; Apollo4 had 7 bits/0x7F).
+//  * Selecting NOCLK (or an unsupported CTIMER source) stops the counter
+//    even after a valid clock ran it (the stock model kept the previous
+//    frequency and the counter free-ran).
+//  * The capture path is functional: a GPIO edge on the STSEL-selected
+//    pin (identity mapping to pad number, polarity per STPOL: 0 = low to
+//    high, 1 = high to low) latches SCAPTn <= STTMR and the CAPTUREx
+//    status atomically, gated on TIMER->GLOBEN.ENABLEALLINPUTS (forwarded
+//    into GlobalInputsEnabled by AmbiqApollo5_TimerStub below, matching
+//    am_hal_stimer_capture_start()/_stop()). Edges are tracked per pin so
+//    repeated same-level stimuli do not re-capture. SCAPTn accepts writes
+//    (am_hal_stimer_reset_config() zeroes them) and STMINTSTAT accepts
+//    direct stores (reset_config writes 0 to it; CMSIS declares it __IOM).
 //  * XTAL-derived CLKSEL frequencies are the real crystal-divided values
-//    (32768/16384/1024 Hz), not the rounded 32/16/1 kHz the Apollo4 model
-//    used. Zephyr's apollo510_evb runs the system clock from CLKSEL=3
-//    (XTAL_32KHZ) with CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC=32768, so the
-//    rounded value would introduce a systematic 2.4% skew between STIMER
-//    time and Renode virtual time.
+//    (32768/16384/1024 Hz), matching CONFIG_SYS_CLOCK_HW_CYCLES_PER_SEC.
 //  * CounterValue is settable from the monitor (e.g.
 //    "sysbus.stimer CounterValue 0xFFFAC000") so tests can preload the
-//    counter near wrap-around and exercise the 32-bit wrap-extension path
-//    of Zephyr's drivers/timer/ambiq_stimer.c in minutes of virtual time
-//    instead of the 36 hours a 32768 Hz counter needs to wrap naturally.
+//    counter near wrap-around; comparator views are resynced and targets
+//    the jump passes over fire immediately, as they would had the time
+//    actually elapsed.
 //
-// Compare semantics (kept from the Apollo4 model, re-verified against the
-// Apollo510 sources): a write to SCMPRn is a DELTA relative to the current
-// COUNTER value - the hardware adds it to COUNTER when the write takes
-// effect and the comparator fires when COUNTER reaches that absolute
-// target; reading SCMPRn returns the absolute target. See hal_ambiq
-// mcu/apollo510/hal/am_hal_stimer.c, am_hal_stimer_compare_delta_set()
-// (write of the adjusted delta to AM_REG_STIMER_COMPARE, with the delta
-// reduced by 3 because "It takes 3 STIMER clock cycles for writes to
-// COMPARE to be effective. Also the interrupt itself is delayed by a
-// cycle") and the SCMPR0 register description in CMSIS apollo510.h
-// ("write the number of ticks in the future ... The hardware does the
-// addition to the COUNTER value in the STIMER clock domain").
+// Compare semantics (verified against the Apollo510 sources): a write to
+// SCMPRn is a DELTA relative to the current COUNTER value - the hardware
+// adds it to COUNTER when the write takes effect and the comparator fires
+// when COUNTER reaches that absolute target; reading SCMPRn returns the
+// absolute target. See hal_ambiq mcu/apollo510/hal/am_hal_stimer.c,
+// am_hal_stimer_compare_delta_set() (write of the adjusted delta to
+// AM_REG_STIMER_COMPARE, with the delta reduced by 3 because "It takes 3
+// STIMER clock cycles for writes to COMPARE to be effective. Also the
+// interrupt itself is delayed by a cycle") and the SCMPR0 register
+// description in CMSIS apollo510.h ("write the number of ticks in the
+// future ... The hardware does the addition to the COUNTER value in the
+// STIMER clock domain").
 //
 using System;
+using System.Collections.Generic;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
@@ -54,7 +83,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         public AmbiqApollo5_SystemTimer(IMachine machine) : base(machine)
         {
             // Changing 'CLKSEL' (it's 'NOCLK' by default) is necessary to enable 'systemTimer'.
-            systemTimer = new LimitTimer(machine.ClockSource, InvalidFrequency, this, "System Timer", uint.MaxValue,
+            systemTimer = new LimitTimer(machine.ClockSource, InvalidFrequency, this, "System Timer", CounterSpan,
                 Direction.Ascending, enabled: false, workMode: WorkMode.Periodic, eventEnabled: true, autoUpdate: true, divider: 1);
             systemTimer.LimitReached += () => HandleLimitReached();
 
@@ -77,10 +106,26 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         public void OnGPIO(int number, bool value)
         {
+            // Track pin levels so only genuine transitions reach the capture
+            // logic - monitor-driven or scripted senders may repeat levels.
+            var previous = gpioStates.TryGetValue(number, out var state) && state;
+            if(value == previous)
+            {
+                return;
+            }
+            gpioStates[number] = value;
             this.Log(LogLevel.Debug, "GPIO#{0} {1}", number, value ? "set" : "unset");
+
+            // am_hal_stimer_capture_start() arms SCAPCTRLn and then sets
+            // TIMER->GLOBEN.ENABLEALLINPUTS; captures only occur while that
+            // cross-peripheral gate is open.
+            if(!GlobalInputsEnabled)
+            {
+                return;
+            }
             foreach(var captureRegister in captureRegisters)
             {
-                captureRegister.OnGPIO(number, value);
+                captureRegister.OnGPIOEdge(number, value);
             }
         }
 
@@ -91,11 +136,18 @@ namespace Antmicro.Renode.Peripherals.Timers
             // All but IRQI should be reset with CompareRegister.Reset; nevertheless, let's unset all IRQs.
             Array.ForEach(interruptOutputs, irq => irq.Unset());
             systemTimer.Reset();
+            overflowStatus = false;
+            gpioStates.Clear();
+            GlobalInputsEnabled = false;
 
             base.Reset();
         }
 
         public ulong Frequency => systemTimer.Frequency;
+
+        // TIMER->GLOBEN.ENABLEALLINPUTS (bit 29 of the TIMER block at
+        // 0x40008008) - forwarded here by AmbiqApollo5_TimerStub.
+        public bool GlobalInputsEnabled { get; set; }
 
         // Comparator IRQs
         public GPIO IRQA => interruptOutputs[0];
@@ -133,16 +185,24 @@ namespace Antmicro.Renode.Peripherals.Timers
         }
 
         // Monitor-settable counter preload used to test counter wrap-around
-        // handling in guest software; keeps the per-comparator timers in sync
-        // with the new base counter value.
+        // handling in guest software. Comparator views are kept coherent:
+        // every enabled comparator whose absolute target lies inside the
+        // jumped-over interval fires immediately, exactly as it would had
+        // the counter really advanced through that range.
         public uint CounterValue
         {
             get => Value;
             set
             {
+                if(clear.Value)
+                {
+                    this.Log(LogLevel.Warning, "Ignoring COUNTER preload of 0x{0:X}: STCFG.CLEAR holds the counter in reset", value);
+                    return;
+                }
+                var previous = Value;
                 systemTimer.Value = value;
-                Array.ForEach(compareRegisters, register => register.SyncValue(value));
-                this.Log(LogLevel.Info, "COUNTER preloaded with 0x{0:X}", value);
+                Array.ForEach(compareRegisters, register => register.HandleCounterJump(previous, value));
+                this.Log(LogLevel.Info, "COUNTER preloaded with 0x{0:X} (was 0x{1:X})", value, previous);
             }
         }
 
@@ -151,21 +211,25 @@ namespace Antmicro.Renode.Peripherals.Timers
             Registers.Capture0.DefineMany(this, 4,
                 (register, registerIndex) =>
                 {
-                    register.WithValueField(0, 32, FieldMode.Read, name: $"SCAPT{registerIndex}",
-                        valueProviderCallback: _ => captureRegisters[registerIndex].ValueCaptured);
+                    // Writable: am_hal_stimer_reset_config() zeroes SCAPT0-3.
+                    register.WithValueField(0, 32, name: $"SCAPT{registerIndex}",
+                        valueProviderCallback: _ => captureRegisters[registerIndex].ValueCaptured,
+                        writeCallback: (_, newValue) => captureRegisters[registerIndex].ValueCaptured = (uint)newValue);
                 }, stepInBytes: 4);
 
             Registers.CaptureControl0.DefineMany(this, 4,
                 (register, registerIndex) =>
                 {
                     var captureRegister = captureRegisters[registerIndex];
-                    register.WithValueField(0, 7, out captureRegister.TriggerSourceGPIOPinNumber, name: $"STSEL{registerIndex}")
-                        .WithReservedBits(7, 1)
+                    // STSEL is 8 bits on Apollo510 (224 GPIO pads; CMSIS
+                    // STIMER_SCAPCTRL0_STSEL0_Msk = 0xFF) - the Apollo4
+                    // layout was 7 bits + reserved.
+                    register.WithValueField(0, 8, out captureRegister.TriggerSourceGPIOPinNumber, name: $"STSEL{registerIndex}")
                         .WithFlag(8, out captureRegister.CaptureOnHighToLowGPIOTransition, name: $"STPOL{registerIndex}")
                         .WithFlag(9, out captureRegister.Enabled, name: $"CAPTURE{registerIndex}")
                         .WithReservedBits(10, 22)
                         ;
-                }, stepInBytes: 4, resetValue: 0x7F);
+                }, stepInBytes: 4, resetValue: 0xFF);
 
             Registers.Compare0.DefineMany(this, 8,
                 (register, registerIndex) =>
@@ -203,8 +267,8 @@ namespace Antmicro.Renode.Peripherals.Timers
             Registers.InterruptClear.Define(this)
                 .WithFlags(0, 8, FieldMode.Write, name: "COMPAREx",
                     writeCallback: (registerIndex, _, newValue) => { if(newValue) compareRegisters[registerIndex].InterruptStatus = false; })
-                .WithFlag(8, out overflowInterruptStatus, FieldMode.WriteOneToClear, name: "OVERFLOW",
-                    changeCallback: (_, __) => UpdateCaptureOverflowIRQ())
+                .WithFlag(8, FieldMode.Write, name: "OVERFLOW",
+                    writeCallback: (_, newValue) => { if(newValue) { overflowStatus = false; UpdateCaptureOverflowIRQ(); } })
                 .WithFlags(9, 4, FieldMode.Write, name: "CAPTUREx",
                     writeCallback: (registerIndex, _, newValue) => { if(newValue) captureRegisters[registerIndex].InterruptStatus = false; })
                 .WithReservedBits(13, 19)
@@ -225,19 +289,26 @@ namespace Antmicro.Renode.Peripherals.Timers
             Registers.InterruptSet.Define(this)
                 .WithFlags(0, 8, FieldMode.Write, name: "COMPAREx",
                     writeCallback: (registerIndex, _, newValue) => { if(newValue) compareRegisters[registerIndex].InterruptStatus = true; })
-                .WithFlag(8, out overflowInterruptStatus, FieldMode.Set, name: "OVERFLOW",
-                    changeCallback: (_, __) => UpdateCaptureOverflowIRQ())
+                .WithFlag(8, FieldMode.Write, name: "OVERFLOW",
+                    writeCallback: (_, newValue) => { if(newValue) { overflowStatus = true; UpdateCaptureOverflowIRQ(); } })
                 .WithFlags(9, 4, FieldMode.Write, name: "CAPTUREx",
                     writeCallback: (registerIndex, _, newValue) => { if(newValue) captureRegisters[registerIndex].InterruptStatus = true; })
                 .WithReservedBits(13, 19)
                 ;
 
+            // Read composes the live statuses; direct writes are honored
+            // (CMSIS declares STMINTSTAT __IOM and
+            // am_hal_stimer_reset_config() stores 0 to it).
             Registers.InterruptStatus.Define(this)
-                .WithFlags(0, 8, FieldMode.Read, name: "COMPAREx",
-                    valueProviderCallback: (registerIndex, _) => compareRegisters[registerIndex].InterruptStatus)
-                .WithFlag(8, out overflowInterruptStatus, FieldMode.Read, name: "OVERFLOW")
-                .WithFlags(9, 4, FieldMode.Read, name: "CAPTUREx",
-                    valueProviderCallback: (registerIdx, _) => captureRegisters[registerIdx].InterruptStatus)
+                .WithFlags(0, 8, name: "COMPAREx",
+                    valueProviderCallback: (registerIndex, _) => compareRegisters[registerIndex].InterruptStatus,
+                    writeCallback: (registerIndex, _, newValue) => compareRegisters[registerIndex].InterruptStatus = newValue)
+                .WithFlag(8, name: "OVERFLOW",
+                    valueProviderCallback: _ => overflowStatus,
+                    writeCallback: (_, newValue) => { overflowStatus = newValue; UpdateCaptureOverflowIRQ(); })
+                .WithFlags(9, 4, name: "CAPTUREx",
+                    valueProviderCallback: (registerIdx, _) => captureRegisters[registerIdx].InterruptStatus,
+                    writeCallback: (registerIdx, _, newValue) => captureRegisters[registerIdx].InterruptStatus = newValue)
                 .WithReservedBits(13, 19)
                 ;
 
@@ -266,7 +337,7 @@ namespace Antmicro.Renode.Peripherals.Timers
         private void HandleLimitReached()
         {
             this.Log(LogLevel.Debug, "COUNTER overflow occurred");
-            overflowInterruptStatus.Value = true;
+            overflowStatus = true;
             UpdateCaptureOverflowIRQ();
         }
 
@@ -281,7 +352,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                     break;
                 }
             }
-            if(!newIrqState && overflowInterruptStatus.Value && overflowInterruptEnable.Value)
+            if(!newIrqState && overflowStatus && overflowInterruptEnable.Value)
             {
                 newIrqState = true;
             }
@@ -321,24 +392,26 @@ namespace Antmicro.Renode.Peripherals.Timers
                 break;
             case ClockSelectValues.LFRC_1KHZ:
                 // "LFRC_NOMINAL : Approximately 900Hz from the LFRC oscillator
-                // (uncalibrated)" - modeled at its nominal value.
+                // (uncalibrated)" - modeled at its nominal value. Software
+                // assuming the historical "1 kHz" name will run ~10% slow.
+                this.Log(LogLevel.Warning, "CLKSEL set to LFRC: modeled at the nominal (uncalibrated) 900 Hz");
                 frequencySet = 900;
                 break;
             case ClockSelectValues.CTIMER0:
             case ClockSelectValues.CTIMER1:
-                this.Log(LogLevel.Warning, "Unsupported CLKSEL value: {0}", clockSelect.Value);
+                this.Log(LogLevel.Warning, "Unsupported CLKSEL value: {0}. Timer will be disabled.", clockSelect.Value);
                 break;
             default:
-                this.Log(LogLevel.Error, "Invalid CLKSEL value: 0x{0:X}", (uint)clockSelect.Value);
+                this.Log(LogLevel.Error, "Invalid CLKSEL value: 0x{0:X}. Timer will be disabled.", (uint)clockSelect.Value);
                 break;
             }
 
-            if(frequencySet != InvalidFrequency)
-            {
-                this.Log(LogLevel.Debug, "Updating timer's frequency to {0} Hz; CLKSEL={1} ({2})", frequencySet, (uint)clockSelect.Value, clockSelect.Value);
-                systemTimer.Frequency = frequencySet;
-                Array.ForEach(compareRegisters, register => register.Frequency = frequencySet);
-            }
+            // Always write the (possibly sentinel) frequency through: leaving
+            // the previous value in place kept the counter free-running after
+            // a switch back to NOCLK.
+            this.Log(LogLevel.Debug, "Updating timer's frequency to {0} Hz; CLKSEL={1} ({2})", frequencySet, (uint)clockSelect.Value, clockSelect.Value);
+            systemTimer.Frequency = frequencySet;
+            Array.ForEach(compareRegisters, register => register.Frequency = frequencySet);
             // CLKSEL influences the timer state depending on whether the frequency is valid or not.
             UpdateSystemTimerState();
         }
@@ -353,20 +426,33 @@ namespace Antmicro.Renode.Peripherals.Timers
             Array.ForEach(compareRegisters, register => register.UpdateState());
         }
 
+        // True iff 'target' lies inside the modular interval (from, to] -
+        // i.e. a counter jumping from 'from' to 'to' passed (or landed on)
+        // the target.
+        private static bool JumpPassedTarget(uint from, uint to, uint target)
+        {
+            return (uint)(target - from - 1) < (uint)(to - from);
+        }
+
         private IFlagRegisterField clear;
         private IEnumRegisterField<ClockSelectValues> clockSelect;
         private IFlagRegisterField freeze;
         private IFlagRegisterField overflowInterruptEnable;
-        private IFlagRegisterField overflowInterruptStatus;
+        private bool overflowStatus;
 
         private readonly CaptureRegister[] captureRegisters = new CaptureRegister[CaptureRegistersCount];
         private readonly CompareRegister[] compareRegisters = new CompareRegister[CompareRegistersCount];
         private readonly GPIO[] interruptOutputs = new GPIO[InterruptOutputsCount];
         private readonly LimitTimer systemTimer;
+        private readonly Dictionary<int, bool> gpioStates = new Dictionary<int, bool>();
 
         private const uint CompareRegistersCount = 8;
         private const uint CaptureRegistersCount = 4;
         private const uint InterruptOutputsCount = 9;
+        // STTMR counts 0..0xFFFFFFFF and overflows "from 0xFFFFFFFF back to
+        // 0x00000000" - a full 2^32-tick lap. (uint.MaxValue here would make
+        // 0xFFFFFFFF unobservable and lose one tick per wrap.)
+        private const ulong CounterSpan = 0x100000000UL;
         // It's used for CLKSEL options which stop the timer. 0 can't be set as the timer's frequency, hence 1.
         private const ulong InvalidFrequency = 1;
 
@@ -379,13 +465,19 @@ namespace Antmicro.Renode.Peripherals.Timers
                 name = $"CAPTURE_{nameSuffix}";
             }
 
-            public void OnGPIO(int number, bool high)
+            public void OnGPIOEdge(int number, bool high)
             {
                 if(Enabled.Value
                         && (int)TriggerSourceGPIOPinNumber.Value == number
-                        // The 'value' is 'true' here if the opposite (low to high) transition has just occurred.
+                        // The 'high' value is the new pin level, so a low-to-high
+                        // transition arrives as 'true'. STPOL: 0 = capture on
+                        // low-to-high, 1 = capture on high-to-low.
                         && CaptureOnHighToLowGPIOTransition.Value != high)
                 {
+                    // "Whenever the event is detected, the value in the COUNTER
+                    // is copied into this register and the corresponding
+                    // interrupt status bit is set." A subsequent event simply
+                    // overwrites - no FIFO, no overrun flag.
                     ValueCaptured = owner.Value;
                     InterruptStatus = true;
                     owner.Log(LogLevel.Debug, "{0}: Register set with value: 0x{1:X}", name, ValueCaptured);
@@ -443,7 +535,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 var nameSuffix = (char)('A' + index);
                 name = $"COMPARE_{nameSuffix}";
 
-                innerTimer = new ComparingTimer(owner.machine.ClockSource, owner.Frequency, owner, name, direction: Direction.Ascending, limit: uint.MaxValue,
+                innerTimer = new ComparingTimer(owner.machine.ClockSource, owner.Frequency, owner, name, direction: Direction.Ascending, limit: CounterSpan,
                         enabled: false, workMode: WorkMode.Periodic, eventEnabled: true, compare: 0, divider: 1);
                 innerTimer.CompareReached += () =>
                 {
@@ -465,8 +557,26 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 if(enabled && systemTimer.Enabled)
                 {
-                    innerTimer.Value = owner.Value;
+                    var value = owner.Value;
+                    innerTimer.Value = value;
                     innerTimer.Enabled = true;
+                    // STMINT COMPAREx documents a "COUNTER is greater than or
+                    // equal to COMPARE" condition. A comparator (re)enabled
+                    // against a target the counter is already at or past would
+                    // otherwise wait a full 2^32-tick lap. "Past" cannot be
+                    // expressed exactly in modular arithmetic; treat a forward
+                    // distance of more than half the counter span as passed.
+                    var distance = (uint)(CompareValue - value);
+                    if(!interruptStatus && (distance == 0 || distance > HalfCounterSpan))
+                    {
+                        // Debug, not Warning: enabling a comparator whose SCMPR
+                        // still holds a stale (e.g. reset) target is a normal
+                        // software flow - the HAL explicitly warns that "the
+                        // application could get a stale interrupt" and expects
+                        // it to be handled gracefully.
+                        owner.Log(LogLevel.Debug, "{0}: enabled with target 0x{1:X} at/behind COUNTER 0x{2:X} - raising the interrupt status immediately (hardware condition is COUNTER >= COMPARE)", name, CompareValue, value);
+                        InterruptStatus = true;
+                    }
                 }
                 else
                 {
@@ -474,11 +584,18 @@ namespace Antmicro.Renode.Peripherals.Timers
                 }
             }
 
-            // Keeps this comparator's view of COUNTER coherent after a
-            // monitor-driven counter preload (see CounterValue).
-            public void SyncValue(uint value)
+            // Keeps this comparator coherent across a monitor-driven counter
+            // jump (see CounterValue): the view of COUNTER is resynced, and a
+            // target inside the jumped-over interval fires immediately - just
+            // as it would had the counter really advanced through the range.
+            public void HandleCounterJump(uint from, uint to)
             {
-                innerTimer.Value = value;
+                innerTimer.Value = to;
+                if(enabled && systemTimer.Enabled && JumpPassedTarget(from, to, CompareValue))
+                {
+                    owner.Log(LogLevel.Info, "{0}: COUNTER jump 0x{1:X}->0x{2:X} passed target 0x{3:X} - raising the interrupt status", name, from, to, CompareValue);
+                    InterruptStatus = true;
+                }
             }
 
             public uint CompareValue
@@ -540,6 +657,8 @@ namespace Antmicro.Renode.Peripherals.Timers
                 }
             }
 
+            private const uint HalfCounterSpan = 0x80000000;
+
             private bool enabled;
             private bool interruptEnable;
             private bool interruptStatus;
@@ -593,5 +712,51 @@ namespace Antmicro.Renode.Peripherals.Timers
             InterruptClear = 0x108,
             InterruptSet = 0x10C,
         }
+    }
+
+    // Minimal stand-in for the Apollo510 TIMER block (0x40008000, the page
+    // below the STIMER): reads-as-written scratch for the whole page, plus
+    // forwarding of GLOBEN.ENABLEALLINPUTS (GLOBEN is at offset 0x10 -
+    // CTRL, STATUS, two reserved words, then GLOBEN per CMSIS TIMER_Type -
+    // bit 29) into the STIMER model's capture gate.
+    // am_hal_stimer_capture_start() sets the bit after arming SCAPCTRLn;
+    // am_hal_stimer_capture_stop() clears it once all four capture units
+    // are disabled.
+    [AllowedTranslations(AllowedTranslation.ByteToDoubleWord | AllowedTranslation.WordToDoubleWord)]
+    public class AmbiqApollo5_TimerStub : IDoubleWordPeripheral, IKnownSize
+    {
+        public AmbiqApollo5_TimerStub(IMachine machine, AmbiqApollo5_SystemTimer systemTimer)
+        {
+            this.systemTimer = systemTimer;
+            Reset();
+        }
+
+        public uint ReadDoubleWord(long offset)
+        {
+            return storage.TryGetValue(offset, out var stored) ? stored : 0;
+        }
+
+        public void WriteDoubleWord(long offset, uint value)
+        {
+            storage[offset] = value;
+            if(offset == GlobalEnableOffset)
+            {
+                systemTimer.GlobalInputsEnabled = ((value >> EnableAllInputsBit) & 1) != 0;
+            }
+        }
+
+        public void Reset()
+        {
+            storage.Clear();
+            systemTimer.GlobalInputsEnabled = false;
+        }
+
+        public long Size => 0x800;
+
+        private readonly Dictionary<long, uint> storage = new Dictionary<long, uint>();
+        private readonly AmbiqApollo5_SystemTimer systemTimer;
+
+        private const long GlobalEnableOffset = 0x10;
+        private const int EnableAllInputsBit = 29;
     }
 }
