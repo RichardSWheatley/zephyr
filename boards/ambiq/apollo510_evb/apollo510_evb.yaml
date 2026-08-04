@@ -7,6 +7,9 @@ flash: 4096
 toolchain:
   - zephyr
   - gnuarmemb
+simulation:
+  - name: renode
+    exec: renode
 supported:
   - uart
   - adc
@@ -29,4 +32,7 @@ testing:
   ignore_tags:
     - net
     - bluetooth
+  renode:
+    uart: sysbus.uart0
+    resc: boards/ambiq/apollo510_evb/support/apollo510_evb.resc
 vendor: ambiq
