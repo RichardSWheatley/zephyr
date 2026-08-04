@@ -196,6 +196,59 @@ both **passed** — `PROGRESS-artifacts/twister-zscilib-qemu-an547.json`,
 Still blocked (B2): the MVE-patched rerun — requires the actual §0 patch; and any
 MVE-accelerated zscilib path on Renode — requires the B1 Renode fixes.
 
+## STIMER model hardening — Compare defects fixed, Capture implemented
+
+Follow-up pass on `support/AmbiqApollo5_SystemTimer.cs` driven by two audits (the
+Apollo510 HAL/CMSIS hardware contract, and the model against Renode's
+LimitTimer/ComparingTimer semantics). Fixes, each verified by the new contract test:
+
+1. **OVERFLOW interrupt flag aliasing (inherited from the upstream Apollo4 model).** One
+   `out` field variable was re-bound across the STMINTCLR/STMINTSET/STMINTSTAT register
+   definitions, so W1C hit an orphaned field: the OVERFLOW status could never be cleared
+   (IRQ 40 latched forever after a wrap) and STMINTSET.OVERFLOW was a no-op. Now a single
+   backing flag with explicit callbacks.
+2. **Counter modulus corrected to 2³²** (was `uint.MaxValue` = 2³²−1): STTMR can now read
+   0xFFFFFFFF, no tick is lost per wrap, and a target landing exactly on the old limit no
+   longer double-fires. **This exposed a matching off-by-one in
+   `drivers/timer/ambiq_stimer.c`** — the driver extends a wrapped counter read by
+   `COUNTER_MAX` (2³²−1) instead of a full 2³² span, losing one cycle (30.5 µs) per wrap;
+   the two errors had cancelled exactly, which is why the earlier wrap validation was
+   green. Driver fixed (`COUNTER_SPAN`), separate commit.
+3. **Fire-on-or-past compare semantics** (STMINT COMPAREx: "COUNTER is greater than or
+   equal to COMPARE"): a counter preload that jumps over an armed target latches that
+   comparator's status immediately (previously it stalled up to ~36 h of virtual time —
+   which also made the `CounterValue` wrap-preload hook strand the kernel's pending tick);
+   a comparator enabled against a stale target likewise latches, mirroring the HAL's
+   documented "the application could get a stale interrupt" behavior.
+4. **SCAPCTRL.STSEL widened to the Apollo510 8-bit layout** (224 pads, reset 0xFF; the
+   Apollo4 7-bit field silently truncated pins ≥ 128).
+5. **CLKSEL→NOCLK now stops a running counter** (inherited upstream defect: the previous
+   frequency was left in place).
+6. **Capture is functional end-to-end**: STSEL identity pin match, STPOL polarity both
+   directions, SCAPTn ← STTMR + CAPTUREx status latching (shared IRQ 40), per-pin edge
+   tracking (no re-capture on repeated levels), SCAPTn writable, STMINTSTAT accepts direct
+   stores, and the cross-peripheral `TIMER->GLOBEN.ENABLEALLINPUTS` gate (offset 0x10
+   bit 29 — measured via bus-access logging; note it is NOT at +0x08) is honored via the
+   new `AmbiqApollo5_TimerStub`, so `am_hal_stimer_capture_stop()`'s
+   clear-only-when-all-disabled protocol is observable.
+7. `CounterValue` preload is rejected with a warning while STCFG.CLEAR is set; LFRC clock
+   selection logs its nominal-900 Hz modeling choice.
+
+**Validation:** `tests/renode-stimer-compcap/` — a robot-harness (renode-test) twister test
+driving the real HAL from the guest while the robot side injects GPIO edges
+(`sysbus.stimer OnGPIO …`) and counter jumps at UART-handshake points. Phases: COMPARE B
+delta/readback/fire-timing, capture on pin 200 (8-bit STSEL regression) incl.
+repeated-level dedup, capture polarity (wrong-edge must not fire), capture_stop GLOBEN
+protocol, jump-past-target immediate fire, overflow IRQ 40 fire + clear (regression for
+fix 1 — a stuck flag would storm the ISR and time out). Result: **passed** —
+`PROGRESS-artifacts/twister-stimer-compcap.json`. T2 timer/sleep suites + wrap-preload run
+re-validated post-change (see artifacts).
+
+Upstream-report candidates for renode-infrastructure (all present in the stock
+`AmbiqApollo4_SystemTimer`): the interrupt-flag aliasing (fix 1), the 2³²−1 modulus
+(fix 2), NOCLK not stopping the counter (fix 5), and the earlier
+`systemTimer.Increment(3)` clock-drift defect (see T2 Finding 1).
+
 ## T6 — Upstream prep notes
 
 - In-tree precedent for partial-SoC Renode board support files: `boards/antmicro/stm32h7_renode_reference_board` (Cortex-M7, own .repl+.resc in support/), `boards/renode/riscv32_virtual`. Maintainer sign-off on the layout remains an open item for the PR thread (no interactive channel from this environment).
