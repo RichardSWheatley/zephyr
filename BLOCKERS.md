@@ -44,6 +44,37 @@ builds, which compile `+nofp+nomve`).
 * Upstream-report material: both reproducers are tiny Zephyr apps; B1.1 additionally
   reproduces with nothing but a `CONFIG_FPU=y` hello_world on apollo510_evb.
 
+## B4 — Renode 1.16.1 CortexM does not enforce ARMv8-M MPU protections
+
+* Symptom A: all `tests/kernel/mem_protect/stack_protection` variants time out — the
+  overflowing thread's stack runs straight through the guard region with no MemManage
+  fault; the handler log shows runaway stores marching below DTCM into unmapped space
+  (`WriteDoubleWord to non existing peripheral at 0x1FF77xxx`).
+* Symptom B: `tests/kernel/sched/schedule_api` passes 17 cases then dies at
+  `test_user_k_is_preempt` (userspace) with `ZEPHYR FATAL ERROR 3/4` and an all-zero
+  exception frame (r0-r14, xpsr, faulting PC all 0x00000000) — the user-mode transition
+  depends on MPU-backed memory domains.
+* Affected scenarios quarantined with reasons in
+  `boards/ambiq/apollo510_evb/support/renode-quarantine.yaml`. Note
+  `kernel.memory_protection.syscalls.*` DO pass — basic syscall/privilege plumbing works;
+  it is the fault-on-violation behavior that is missing.
+* What was NOT verified: MPU-guard fault delivery and userspace isolation semantics on
+  this platform.
+
+## B5 — ambiq_stimer: fractional cycles-per-tick aliasing (real driver finding, not a simulation artifact)
+
+* `tests/kernel/tickless/tickless_concept` forces `CONFIG_SYS_CLOCK_TICKS_PER_SEC=100`;
+  with the 32768 Hz STIMER that makes CYC_PER_TICK = 327.68, truncated to 327 by the
+  driver's integer arithmetic (`drivers/timer/ambiq_stimer.c` `CYC_PER_TICK`).
+* Measured effect (deterministic in virtual time): time slices of 11 / 20 / 0 / 0 ticks
+  against an expected 10±1 — slice boundaries alias against the fractional tick period,
+  and the follow-on `test_tickless_sysclock` case fails by cascade (its semaphore is given
+  early).
+* This reproduces on physical hardware for any tick rate that does not divide 32768; the
+  board's default 1024 ticks/s divides exactly (32 cycles/tick) and is unaffected.
+* Suggested follow-up (out of scope here): carry the fractional remainder in the driver's
+  tick accounting, or constrain SYS_CLOCK_TICKS_PER_SEC to divisors of 32768 via Kconfig.
+
 ## B2 — zscilib MVE patch unavailable (handoff §0 never filled in)
 
 The handoff's zscilib MVE RFC link and patch file fields are placeholders; no patch file
