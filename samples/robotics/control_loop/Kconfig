@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: Apache-2.0
+mainmenu "Robotics control loop sample"
+
+choice APP_TRANSPORT
+	prompt "Telemetry/command bridge"
+	default APP_TRANSPORT_NONE
+	help
+	  Optional bridge that exports sensor/actuator telemetry and
+	  accepts setpoint/e-stop commands over a byte transport. The
+	  control loop itself has no transport knowledge either way.
+
+config APP_TRANSPORT_NONE
+	bool "None (local loop only)"
+
+config APP_TRANSPORT_SERIAL
+	bool "Serial (UART named by the bridge-uart alias)"
+	depends on SERIAL && UART_INTERRUPT_DRIVEN
+
+config APP_TRANSPORT_UDP
+	bool "UDP socket"
+	depends on NET_SOCKETS
+
+endchoice
+
+config APP_UDP_LOCAL_PORT
+	int "UDP local port"
+	depends on APP_TRANSPORT_UDP
+	default 17448
+
+config APP_UDP_PEER_ADDR
+	string "UDP peer IPv4 address"
+	depends on APP_TRANSPORT_UDP
+	default "127.0.0.1"
+
+config APP_UDP_PEER_PORT
+	int "UDP peer port"
+	depends on APP_TRANSPORT_UDP
+	default 17448
+
+source "Kconfig.zephyr"
