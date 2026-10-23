@@ -351,8 +351,13 @@ void soc_early_init_hook(void)
 
 	/* Powering down various peripheral power domains */
 	am_hal_pwrctrl_periph_disable(AM_HAL_PWRCTRL_PERIPH_DEBUG);
+#if !IS_ENABLED(CONFIG_SOC_AMBIQ_KEEP_CRYPTO_ON)
+	/* Powering the CRYPTO domain down drops the CryptoCell's engine-side
+	 * copy of the hardware keys the secure bootloader left loaded.
+	 */
 	am_hal_pwrctrl_periph_disable(AM_HAL_PWRCTRL_PERIPH_CRYPTO);
 	am_hal_pwrctrl_periph_disable(AM_HAL_PWRCTRL_PERIPH_OTP);
+#endif
 
 #if defined(CONFIG_SOC_APOLLO510L) || defined(CONFIG_SOC_APOLLO330P)
 	/* Using LFRC instead of XT for RTC Clock Source */

@@ -15,6 +15,7 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
+#include <zephyr/cache.h>
 #include <am_mcu_apollo.h>
 #include <nema_dc_regs.h>
 #include <nema_dc_hal.h>
@@ -172,6 +173,11 @@ static ssize_t mipi_dsi_ambiq_transfer(const struct device *dev, uint8_t channel
 				      data->dc_config.ui32BackPorchY);
 			data->dc_layer.stride =
 				nemadc_stride_size(data->dc_layer.format, data->dc_layer.resx);
+			/* The display controller fetches the frame by DMA: write back any
+			 * of it still held in the data cache, or the panel shows stale
+			 * SRAM for the most recently drawn lines.
+			 */
+			sys_cache_data_flush_range((void *)msg->tx_buf, msg->tx_len);
 			data->dc_layer.baseaddr_virt = (void *)msg->tx_buf;
 			data->dc_layer.baseaddr_phys = (unsigned int)(data->dc_layer.baseaddr_virt);
 			nemadc_set_layer(0, &data->dc_layer);

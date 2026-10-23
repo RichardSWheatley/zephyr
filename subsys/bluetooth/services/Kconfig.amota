@@ -10,6 +10,27 @@ menuconfig BT_AMOTA
 
 if BT_AMOTA
 
+config BT_AMOTA_MAX_IMAGE_SIZE
+	hex "Maximum application image size"
+	default 0x80000
+	help
+	  Size reserved for the running application image, starting at the
+	  application load address. The OTA descriptor is placed right after
+	  this area and the incoming image is staged after the descriptor, up
+	  to the end of MRAM. Must be a multiple of 1 KiB and larger than the
+	  application image, or an update erases the running application.
+
+config BT_AMOTA_REQUIRE_ENCRYPTION
+	bool "Accept firmware only over an encrypted link"
+	depends on BT_SMP
+	help
+	  Enabling AMOTA notifications and writing AMOTA packets need an
+	  encrypted (paired) link, so a device in radio range cannot replace
+	  the firmware without pairing first. The notification enable is a
+	  write request, so the client gets "insufficient encryption" and
+	  pairs; packet writes are write commands and are dropped silently
+	  on an unencrypted link.
+
 config BT_AMOTA_IDLE_TIMEOUT
 	int "OTA idle timeout in seconds"
 	default 60

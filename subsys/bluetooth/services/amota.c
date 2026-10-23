@@ -12,6 +12,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/init.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/linker/linker-defs.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/hci.h>
@@ -60,8 +61,8 @@ static void amotas_dcache_clean_mram_src(const void *buf, uint32_t len)
 
 /* ****************************************************************************
  *
- * Define the OTA Descriptor address by reserving default maximum 512k bytes app
- * image/upgrading image size. Allocate AM_HAL_FLASH_PAGE_SIZE bytes for the OTA
+ * Define the OTA Descriptor address by reserving CONFIG_BT_AMOTA_MAX_IMAGE_SIZE
+ * bytes for the app image/upgrading image. Allocate AM_HAL_FLASH_PAGE_SIZE bytes for the OTA
  * Descriptor. OTA Descriptor needs to be made sure no overlaps with the current
  * running app image and the upgrading image storage area:
  * - OTA_POINTER_LOCATION should be larger than app start address + app image size
@@ -72,7 +73,7 @@ static void amotas_dcache_clean_mram_src(const void *buf, uint32_t len)
  * - 0x00410000 for Apollo510, Apollo330P, and Apollo510L by default.
  * ****************************************************************************
  */
-#define OTA_MAX_IMAGE_SIZE  (512 * 1024)
+#define OTA_MAX_IMAGE_SIZE  CONFIG_BT_AMOTA_MAX_IMAGE_SIZE
 #define OTA_DESCRIPTOR_SIZE AM_HAL_FLASH_PAGE_SIZE
 #if IS_ENABLED(CONFIG_SOC_SERIES_APOLLO4X)
 #if defined(AM_HAL_MRAM_TOTAL_SIZE) && (OTA_MAX_IMAGE_SIZE > (AM_HAL_MRAM_TOTAL_SIZE - 0x18000) / 2)
@@ -92,12 +93,18 @@ static void amotas_dcache_clean_mram_src(const void *buf, uint32_t len)
 #define AMOTA_INT_FLASH_OTA_ADDRESS 0x00050000
 #endif
 
-/* User specified maximum size of OTA storage area.
+#if defined(AM_HAL_MRAM_LARGEST_VALID_ADDR)
+BUILD_ASSERT(AMOTA_INT_FLASH_OTA_ADDRESS + AM_HAL_FLASH_PAGE_SIZE <= AM_HAL_MRAM_LARGEST_VALID_ADDR,
+	     "CONFIG_BT_AMOTA_MAX_IMAGE_SIZE leaves no OTA staging area in MRAM");
+#endif
+
+/* Maximum size of the OTA staging area: the incoming image can be no larger
+ * than the area reserved for the running one, and staging stops there so
+ * anything placed after it (e.g. a settings partition) survives an update.
  * Make sure the size is flash page multiple.
- * (Default value is determined based on rest of flash from the start).
  */
 #define AMOTA_INT_FLASH_OTA_MAX_SIZE                                                               \
-	(AM_HAL_MRAM_LARGEST_VALID_ADDR - AMOTA_INT_FLASH_OTA_ADDRESS + 1)
+	MIN(AM_HAL_MRAM_LARGEST_VALID_ADDR - AMOTA_INT_FLASH_OTA_ADDRESS + 1, OTA_MAX_IMAGE_SIZE)
 
 /* Protection against NULL pointer */
 #define FLASH_OPERATE(pFlash, func) ((pFlash)->func ? (pFlash)->func() : 0)
@@ -120,6 +127,38 @@ uint32_t amotasTmpBuf[AMOTA_PACKET_SIZE / 4];
 
 struct bt_amota amota;
 static struct bt_gatt_attr *amota_notify_ch;
+
+static void (*amota_cb)(const struct bt_amota_status *status);
+
+void bt_amota_register_cb(void (*cb)(const struct bt_amota_status *status))
+{
+	amota_cb = cb;
+}
+
+static void amotas_event(enum bt_amota_event event)
+{
+	if (amota_cb != NULL) {
+		struct bt_amota_status status = {
+			.event = event,
+			.offset = amota.data.newFwFlashInfo.offset,
+			.length = amota.data.fwHeader.fwLength,
+			.version = amota.data.fwHeader.version,
+			.image_id = amota.data.fwHeader.imageId,
+			.data_type = amota.data.fwHeader.fwDataType,
+		};
+
+		amota_cb(&status);
+	}
+}
+
+/* Offset and running image CRC at the start of the page being buffered, so a
+ * failed page write can roll back to a point the client can resend from
+ */
+static uint32_t amotas_page_start_offset;
+static uint32_t amotas_page_start_crc;
+
+/* Attempts at writing and verifying one MRAM page before giving up */
+#define AMOTA_WRITE_ATTEMPTS 3
 static am_util_multiboot_flash_info_t *g_pFlash = &g_intFlash;
 
 /* CRC-32 table for OTA data CRC calculation */
@@ -194,7 +233,7 @@ static void amotas_send_data(uint8_t *buf, uint16_t len)
 {
 	int err;
 
-	LOG_INF("%s - bt_gatt_notify, len=%d", __func__, len);
+	LOG_DBG("%s - bt_gatt_notify, len=%d", __func__, len);
 	err = bt_gatt_notify(amota.conn, amota_notify_ch, buf, len);
 	if (err) {
 		LOG_ERR("%s: bt_gatt_notify failed: %d", __func__, err);
@@ -287,6 +326,7 @@ static void amotas_timeout_work_handler(struct k_work *work)
 
 		LOG_WRN("AMOTA transfer idle timeout at offset 0x%x",
 			amota.data.newFwFlashInfo.offset);
+		amotas_event(BT_AMOTA_EVT_FAILED);
 		data[0] = (amota.data.newFwFlashInfo.offset) & 0xff;
 		data[1] = (amota.data.newFwFlashInfo.offset >> 8) & 0xff;
 		data[2] = (amota.data.newFwFlashInfo.offset >> 16) & 0xff;
@@ -328,6 +368,15 @@ static bool amotas_set_fw_addr(void)
 	amota.data.newFwFlashInfo.addr = 0;
 	amota.data.newFwFlashInfo.offset = 0;
 
+	/* Staging the new image must not erase the running one */
+	if ((uintptr_t)__rom_region_start + (uintptr_t)_flash_used > OTA_POINTER_LOCATION) {
+		LOG_ERR("running image ends at 0x%lx, past OTA descriptor 0x%x; raise "
+			"CONFIG_BT_AMOTA_MAX_IMAGE_SIZE",
+			(unsigned long)((uintptr_t)__rom_region_start + (uintptr_t)_flash_used),
+			OTA_POINTER_LOCATION);
+		return false;
+	}
+
 	/* Check storage type */
 	if (amota.data.fwHeader.storageType == AMOTA_FW_STORAGE_INTERNAL) {
 		uint32_t storeAddr = (AMOTA_INT_FLASH_OTA_ADDRESS + AMOTA_WRITE_PAGE_SIZE - 1) &
@@ -340,6 +389,22 @@ static bool amotas_set_fw_addr(void)
 				maxSize, amota.data.fwHeader.fwLength);
 			return false;
 		}
+
+#if IS_ENABLED(CONFIG_SOC_APOLLO510L) || IS_ENABLED(CONFIG_SOC_APOLLO330P)
+		/* The radio core runs its firmware from MRAM at CM4CODEBASE; MRAM
+		 * writes there do not take, so a staging area running into it
+		 * fails verification at the end of a long transfer. Refuse up
+		 * front instead.
+		 */
+		uint32_t rss_base = MCUCTRL->CM4CODEBASE;
+
+		if (rss_base > storeAddr && storeAddr + amota.data.fwHeader.fwLength > rss_base) {
+			LOG_ERR("staging 0x%x-0x%x runs into the radio firmware at 0x%x; lower "
+				"CONFIG_BT_AMOTA_MAX_IMAGE_SIZE",
+				storeAddr, storeAddr + amota.data.fwHeader.fwLength, rss_base);
+			return false;
+		}
+#endif
 
 		g_pFlash = &g_intFlash;
 		amota.data.newFwFlashInfo.addr = storeAddr;
@@ -386,8 +451,20 @@ static int verify_flash_content(uint32_t flashAddr, uint32_t *pSram, uint32_t le
 		ret = memcmp(amotasTmpBuf, (uint8_t *)((uint32_t)pSram + offset), tmpSize);
 
 		if (ret != 0) {
-			LOG_WRN("flash write verify failed. address 0x%x. length %d", flashAddr,
-				len);
+			const uint8_t *got = (const uint8_t *)amotasTmpBuf;
+			const uint8_t *want = (const uint8_t *)pSram + offset;
+			uint32_t i = 0;
+			uint32_t bad = 0;
+
+			while (i < tmpSize && got[i] == want[i]) {
+				i++;
+			}
+			for (uint32_t j = i; j < tmpSize; j++) {
+				bad += (got[j] != want[j]);
+			}
+			LOG_WRN("flash write verify failed. address 0x%x. length %d: first "
+				"difference at +%u (read 0x%02x, expected 0x%02x), %u bytes differ",
+				flashAddr, len, offset + i, got[i], want[i], bad);
 			break;
 		}
 		offset += tmpSize;
@@ -441,13 +518,25 @@ static bool amotas_write2flash(uint16_t len, uint8_t *buf, uint32_t addr, bool l
 			amotas_dcache_clean_mram_src(amotasFlash.writeBuffer,
 						     g_pFlash->flashPageSize);
 #endif
-			/* Always write whole pages */
-			if ((g_pFlash->flash_write_page(ui32TargetAddress,
-							(uint32_t *)amotasFlash.writeBuffer,
-							g_pFlash->flashPageSize) != 0) ||
-			    (verify_flash_content(ui32TargetAddress,
-						  (uint32_t *)amotasFlash.writeBuffer,
-						  amotasFlash.bufferIndex, g_pFlash) != 0)) {
+			/* Always write whole pages; retry a page that does not read back */
+			bool written = false;
+
+			for (int attempt = 1; attempt <= AMOTA_WRITE_ATTEMPTS && !written;
+			     attempt++) {
+				written = (g_pFlash->flash_write_page(
+						   ui32TargetAddress,
+						   (uint32_t *)amotasFlash.writeBuffer,
+						   g_pFlash->flashPageSize) == 0) &&
+					  (verify_flash_content(ui32TargetAddress,
+								(uint32_t *)amotasFlash.writeBuffer,
+								amotasFlash.bufferIndex,
+								g_pFlash) == 0);
+				if (!written && attempt < AMOTA_WRITE_ATTEMPTS) {
+					LOG_WRN("rewriting page 0x%x (attempt %d)",
+						ui32TargetAddress, attempt + 1);
+				}
+			}
+			if (!written) {
 				bResult = false;
 				/* Discard buffered page so the next FW_DATA uses a consistent
 				 * addr/index.
@@ -524,7 +613,10 @@ void amotas_packet_handler(eAmotaCommand cmd, uint16_t len, uint8_t *buf)
 			}
 		}
 
-		amota.data.imageCalCrc = 0;
+		/* A resumed transfer keeps the CRC of what it already has */
+		if (!resumeTransfer) {
+			amota.data.imageCalCrc = 0;
+		}
 		amota.data.fwHeader.encrypted = sys_get_le32(buf);
 		amota.data.fwHeader.fwStartAddr = sys_get_le32(buf + 4);
 		amota.data.fwHeader.fwLength = sys_get_le32(buf + 8);
@@ -554,6 +646,10 @@ void amotas_packet_handler(eAmotaCommand cmd, uint16_t len, uint8_t *buf)
 			LOG_INF("beginning of flash addr = 0x%x", amota.data.newFwFlashInfo.addr);
 		} else {
 			LOG_INF("OTA process start from beginning");
+			/* Disarm an image verified earlier: a reset during this
+			 * transfer must not install the half-overwritten staging area
+			 */
+			amotas_init_ota();
 			amotasFlash.bufferIndex = 0;
 			bResult = amotas_set_fw_addr();
 
@@ -584,11 +680,18 @@ void amotas_packet_handler(eAmotaCommand cmd, uint16_t len, uint8_t *buf)
 		data[2] = ((amota.data.newFwFlashInfo.offset >> 16) & 0xff);
 		data[3] = ((amota.data.newFwFlashInfo.offset >> 24) & 0xff);
 		amotas_reply_to_client(cmd, AMOTA_STATUS_SUCCESS, data, sizeof(data));
+		amotas_event(BT_AMOTA_EVT_START);
 		break;
 
 	case AMOTA_CMD_FW_DATA: {
 		if (amota.data.newFwFlashInfo.offset == 0) {
 			memcpy(&amota.data.metaData, buf, sizeof(amotaMetadataInfo_t));
+		}
+
+		/* First bytes of a page: remember where it starts */
+		if (amotasFlash.bufferIndex == 0) {
+			amotas_page_start_offset = amota.data.newFwFlashInfo.offset;
+			amotas_page_start_crc = amota.data.imageCalCrc;
 		}
 
 		if (amota.data.fwHeader.imageId == AMOTA_IMAGE_ID_SBL) {
@@ -617,6 +720,14 @@ void amotas_packet_handler(eAmotaCommand cmd, uint16_t len, uint8_t *buf)
 		}
 
 		if (bResult == false) {
+			/* The buffered start of the page is gone: go back to the page
+			 * start, which is where the client must resend from
+			 */
+			amota.data.newFwFlashInfo.offset = amotas_page_start_offset;
+			amota.data.imageCalCrc = amotas_page_start_crc;
+			amotasFlash.bufferIndex = 0;
+			LOG_WRN("page write failed; client resends from offset 0x%x",
+				amota.data.newFwFlashInfo.offset);
 			data[0] = ((amota.data.newFwFlashInfo.offset) & 0xff);
 			data[1] = ((amota.data.newFwFlashInfo.offset >> 8) & 0xff);
 			data[2] = ((amota.data.newFwFlashInfo.offset >> 16) & 0xff);
@@ -633,6 +744,7 @@ void amotas_packet_handler(eAmotaCommand cmd, uint16_t len, uint8_t *buf)
 			data[2] = ((amota.data.newFwFlashInfo.offset >> 16) & 0xff);
 			data[3] = ((amota.data.newFwFlashInfo.offset >> 24) & 0xff);
 			amotas_reply_to_client(cmd, AMOTA_STATUS_SUCCESS, data, sizeof(data));
+			amotas_event(BT_AMOTA_EVT_PROGRESS);
 		}
 	} break;
 
@@ -643,9 +755,11 @@ void amotas_packet_handler(eAmotaCommand cmd, uint16_t len, uint8_t *buf)
 
 			/* Update flash flag page here */
 			amotas_update_ota();
+			amotas_event(BT_AMOTA_EVT_VERIFIED);
 		} else {
 			LOG_WRN("CRC verification fails");
 			amotas_reply_to_client(cmd, AMOTA_STATUS_CRC_ERROR, NULL, 0);
+			amotas_event(BT_AMOTA_EVT_FAILED);
 		}
 		FLASH_OPERATE(g_pFlash, flash_deinit);
 		amota.data.state = AMOTA_STATE_INIT;
@@ -663,6 +777,7 @@ void amotas_packet_handler(eAmotaCommand cmd, uint16_t len, uint8_t *buf)
 		k_sleep(K_MSEC(100));
 
 		amotas_reply_to_client(cmd, AMOTA_STATUS_SUCCESS, NULL, 0);
+		amotas_event(BT_AMOTA_EVT_RESET);
 
 		/* Delay here to let packet go through the RF before we disconnect */
 		k_sleep(K_MSEC(1000));
@@ -694,13 +809,19 @@ static void amota_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_t valu
 static ssize_t write_callback(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			      const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
 
+#if defined(CONFIG_BT_AMOTA_REQUIRE_ENCRYPTION)
+#define AMOTA_PERM_WRITE BT_GATT_PERM_WRITE_ENCRYPT
+#else
+#define AMOTA_PERM_WRITE BT_GATT_PERM_WRITE
+#endif
+
 /* AMOTA Service Declaration */
 BT_GATT_SERVICE_DEFINE(amota_svc, BT_GATT_PRIMARY_SERVICE(BT_UUID_AMOTA),
 		       BT_GATT_CHARACTERISTIC(BT_UUID_AMOTA_TX_CHAR, BT_GATT_CHRC_NOTIFY,
 					      BT_GATT_PERM_READ, NULL, NULL, NULL),
-		       BT_GATT_CCC(amota_ccc_cfg_changed, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+		       BT_GATT_CCC(amota_ccc_cfg_changed, BT_GATT_PERM_READ | AMOTA_PERM_WRITE),
 		       BT_GATT_CHARACTERISTIC(BT_UUID_AMOTA_RX_CHAR,
-					      BT_GATT_CHRC_WRITE_WITHOUT_RESP, BT_GATT_PERM_WRITE,
+					      BT_GATT_CHRC_WRITE_WITHOUT_RESP, AMOTA_PERM_WRITE,
 					      NULL, write_callback, NULL));
 
 static ssize_t write_callback(struct bt_conn *conn, const struct bt_gatt_attr *attr,
@@ -773,7 +894,7 @@ static ssize_t write_callback(struct bt_conn *conn, const struct bt_gatt_attr *a
 			amota.data.pkt.len = 0;
 		} else {
 
-			LOG_INF("Packet received correctly, OTA is ongoing...");
+			LOG_DBG("Packet received correctly, OTA is ongoing...");
 
 			amotas_packet_handler(amota.data.pkt.type,
 					      amota.data.pkt.len - AMOTA_CRC_SIZE_IN_PKT,
@@ -850,6 +971,10 @@ int bt_amota_conn_init(struct bt_conn *conn)
 
 void bt_amota_conn_deinit(void)
 {
+	if (amota.data.state == AMOTA_STATE_GETTING_FW) {
+		amotas_event(BT_AMOTA_EVT_DISCONNECTED);
+	}
+
 #if CONFIG_BT_AMOTA_IDLE_TIMEOUT > 0 || CONFIG_BT_AMOTA_PARTIAL_PKT_TIMEOUT > 0
 	k_mutex_lock(&amotas_pkt_mutex, K_FOREVER);
 	amotas_timeout_cancel();

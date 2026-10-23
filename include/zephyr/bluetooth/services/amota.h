@@ -45,6 +45,45 @@ extern "C" {
 #define AMOTA_ENCRYPTED_SBL_SIZE    (32 * 1024)
 #define AMOTA_INVALID_SBL_STOR_ADDR (0xFFFFFFFF)
 
+/** Firmware update progress, for an application to show (e.g. a progress screen). */
+enum bt_amota_event {
+	/** FW_HEADER accepted; offset is non-zero when a transfer resumes */
+	BT_AMOTA_EVT_START,
+	/** A FW_DATA packet was stored */
+	BT_AMOTA_EVT_PROGRESS,
+	/** The whole image arrived and its CRC matched; the install is armed */
+	BT_AMOTA_EVT_VERIFIED,
+	/** The update failed (image CRC mismatch, flash write, or timeout) */
+	BT_AMOTA_EVT_FAILED,
+	/** The device resets now; the bootloader installs the image */
+	BT_AMOTA_EVT_RESET,
+	/** The link dropped during a transfer */
+	BT_AMOTA_EVT_DISCONNECTED,
+};
+
+/** Firmware update progress report */
+struct bt_amota_status {
+	/** What happened */
+	enum bt_amota_event event;
+	/** Bytes of the image received so far */
+	uint32_t offset;
+	/** Image length from the update header */
+	uint32_t length;
+	/** Version field of the update header */
+	uint32_t version;
+	/** AMOTA_IMAGE_ID_SBL for the secure bootloader, anything else an application */
+	uint32_t image_id;
+	/** 0 firmware, 1 data */
+	uint32_t data_type;
+};
+
+/**
+ * @brief Register a callback for firmware update progress.
+ *
+ * Called from the Bluetooth receive path: it must not block.
+ */
+void bt_amota_register_cb(void (*cb)(const struct bt_amota_status *status));
+
 /** @brief amota state */
 typedef enum {
 	AMOTA_STATE_INIT,
